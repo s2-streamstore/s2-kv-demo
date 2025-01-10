@@ -2,6 +2,8 @@
 
 Example REST KV-store built on S2.
 
+This accompanies a post on the s2.dev blog -- see [here](https://s2.dev/blog/kv-store) for more context.
+
 ## Demo 
 
 ### Pre-requisites
