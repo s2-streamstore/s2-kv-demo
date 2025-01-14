@@ -12,12 +12,12 @@ use humantime::parse_duration;
 use ordered_float::OrderedFloat;
 use s2::client::{ClientConfig, ClientError, S2Endpoints, StreamClient};
 use s2::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError,
-    ReadOutput, ReadSessionRequest, SequencedRecord,
+    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadOutput,
+    ReadSessionRequest, SequencedRecord,
 };
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::cmp::PartialEq;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::ops::{RangeFrom, RangeTo};
 use std::sync::Arc;
@@ -275,8 +275,7 @@ impl KVStore {
                                 records: AppendRecordBatch::try_from_iter(
                                     [AppendRecord::new(bytes::Bytes::from(log))?]
                                 ).map_err(|_| KVError::Weird("unable to construct batch"))?,
-                                match_seq_num: None,
-                                fencing_token: None,
+                                ..Default::default()
                             }).map_err(|_| KVError::Weird("s2 append_session rx dropped"))?;
                         }
                         OrchestratorCommand::ReadStrongConsistency {
