@@ -11,10 +11,7 @@ use futures::TryFutureExt;
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
 use s2::client::{ClientConfig, ClientError, S2Endpoints, StreamClient};
-use s2::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadOutput,
-    ReadSessionRequest, SequencedRecord,
-};
+use s2::types::{AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadLimit, ReadOutput, ReadSessionRequest, SequencedRecord};
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
 use std::cmp::Reverse;
@@ -245,7 +242,7 @@ impl KVStore {
             client
                 .read_session(ReadSessionRequest {
                     start_seq_num: local_state.applied_state.end,
-                    limit: None,
+                    limit: ReadLimit::default(),
                 })
                 .await?,
             |read_output| {
