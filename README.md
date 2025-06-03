@@ -12,10 +12,10 @@ This accompanies a post on the s2.dev blog -- see [here](https://s2.dev/blog/kv-
 
 - We'll be using the [S2 CLI](https://github.com/s2-streamstore/s2-cli) as well, so make sure that is also [setup](https://s2.dev/docs/quickstart#get-started-with-the-cli).
 
-- Finally, be sure to make your auth token accessible; the code in this repo will expect to read it from the `S2_AUTH_TOKEN` env var:
+- Finally, be sure to make your auth token accessible; the code in this repo will expect to read it from the `S2_ACCESS_TOKEN` env var:
 
   ```bash
-  export S2_AUTH_TOKEN="<authentication token>"
+  export S2_ACCESS_TOKEN="<authentication token>"
   ```
 
   Use an existing token, or generate a new one from [s2.dev](https://s2.dev/dashboard).
