@@ -11,7 +11,7 @@ use futures::TryFutureExt;
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
 use s2::client::{ClientConfig, ClientError, S2Endpoints, StreamClient};
-use s2::types::{AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadLimit, ReadOutput, ReadSessionRequest, SequencedRecord};
+use s2::types::{AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadLimit, ReadOutput, ReadSessionRequest, ReadStart, SequencedRecord};
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
 use std::cmp::Reverse;
@@ -202,7 +202,7 @@ impl KVStore {
                     trace!(?tail);
                     for rider in queue.drain(..) {
                         _ = rider
-                            .send(Ok(..tail))
+                            .send(Ok(..tail.seq_num))
                             .inspect_err(|_| debug!("SC caller disconnected before check_tail returned"));
                     }
                     next_departure = Instant::now() + sometime_later;
@@ -241,7 +241,7 @@ impl KVStore {
         let tailing_reader = futures::StreamExt::flat_map(
             client
                 .read_session(ReadSessionRequest {
-                    start_seq_num: local_state.applied_state.end,
+                    start: ReadStart::SeqNum(local_state.applied_state.end),
                     limit: ReadLimit::default(),
                 })
                 .await?,
@@ -311,7 +311,7 @@ impl KVStore {
                     // we can acknowledge them as soon as their corresponding log append is ack-ed
                     // by S2, even if they are not yet applied to the local internalized state.
                     _ = response_tx
-                        .send(Ok(..ack.end_seq_num))
+                        .send(Ok(..ack.end.seq_num))
                         .inspect_err(|_| debug!("write ack rx dropped"));
                 }
 
@@ -597,7 +597,7 @@ async fn main() -> eyre::Result<()> {
 
     let args = Args::parse();
     let stream_client = StreamClient::new(
-        ClientConfig::new(std::env::var("S2_AUTH_TOKEN")?)
+        ClientConfig::new(std::env::var("S2_ACCESS_TOKEN")?)
             .with_endpoints(S2Endpoints::from_env().map_err(|msg| eyre!(msg))?),
         args.basin.parse::<BasinName>()?,
         args.stream,
