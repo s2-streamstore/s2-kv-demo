@@ -243,6 +243,8 @@ impl KVStore {
                 .read_session(ReadSessionRequest {
                     start: ReadStart::SeqNum(local_state.applied_state.end),
                     limit: ReadLimit::default(),
+                    until: None,
+                    clamp: false,
                 })
                 .await?,
             |read_output| {
