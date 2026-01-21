@@ -10,8 +10,12 @@ use eyre::eyre;
 use futures::TryFutureExt;
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
-use s2::client::{ClientConfig, ClientError, S2Endpoints, StreamClient};
-use s2::types::{AppendInput, AppendRecord, AppendRecordBatch, BasinName, ConvertError, ReadLimit, ReadOutput, ReadSessionRequest, ReadStart, SequencedRecord};
+use s2_sdk::append_session::AppendSessionConfig;
+use s2_sdk::types::{
+    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ReadBatch, ReadFrom, ReadInput,
+    ReadStart, S2Config, S2Endpoints, S2Error, SequencedRecord, StreamName, ValidationError,
+};
+use s2_sdk::{S2, S2Stream};
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
 use std::cmp::Reverse;
@@ -20,8 +24,7 @@ use std::ops::{RangeFrom, RangeTo};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep_until, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::time::{Instant, sleep_until};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
@@ -42,10 +45,10 @@ enum KVError {
     JsonError(String),
     #[error("orchestrator task failed")]
     OrchestratorTaskFailure,
-    #[error("record convert: {0}")]
-    RecordConvertError(#[from] ConvertError),
-    #[error("s2 client: {0}")]
-    S2ClientError(#[from] ClientError),
+    #[error("validation: {0}")]
+    ValidationError(#[from] ValidationError),
+    #[error("s2: {0}")]
+    S2Error(#[from] S2Error),
     #[error("{0}")]
     Weird(&'static str),
 }
@@ -176,7 +179,7 @@ impl KVStore {
     /// Implements the "bus stand" optimization from <https://maheshba.bitbucket.io/papers/osr2024.pdf>,
     /// allowing multiple readers to be serviced by the same underlying `check_tail` invocation.
     async fn bus_stand(
-        client: StreamClient,
+        stream: S2Stream,
         cancellation_token: CancellationToken,
         mut inbox: mpsc::UnboundedReceiver<BusRider>,
     ) -> Result<(), KVError> {
@@ -198,7 +201,7 @@ impl KVStore {
                 },
                 _ = sleep_until(next_departure), if !queue.is_empty() => {
                     trace!(num_passengers=queue.len(), "next departure is leaving!");
-                    let tail = client.check_tail().await?;
+                    let tail = stream.check_tail().await?;
                     trace!(?tail);
                     for rider in queue.drain(..) {
                         _ = rider
@@ -217,41 +220,33 @@ impl KVStore {
     }
 
     async fn orchestrate(
-        client: StreamClient,
+        stream: S2Stream,
         cancellation_token: CancellationToken,
         mut local_state: LocalState,
         mut command_rx: mpsc::UnboundedReceiver<OrchestratorCommand>,
         throttle: Throttle,
     ) -> Result<(), KVError> {
+        use futures::stream::FuturesOrdered;
+
         let _guard = cancellation_token.drop_guard();
 
-        // Writes to S2 that are "inflight", and have not yet received acknowledgment.
-        let mut write_queue: VecDeque<WriteSender> = VecDeque::new();
         // Blocked responses for internal callers.
         let mut pending_responses = PendingResponses::default();
 
         // Start an append session.
-        let (append_tx, append_rx) = mpsc::unbounded_channel();
-        let append_acknowledgments = client
-            .append_session(UnboundedReceiverStream::new(append_rx))
-            .await?
-            .throttle(throttle.throttle_append_acknowledgments);
+        let append_session = stream.append_session(AppendSessionConfig::default());
+        // Track pending append tickets paired with response senders (ordered for FIFO).
+        let mut pending_appends: FuturesOrdered<_> = FuturesOrdered::new();
 
         // Start a tailing read session.
+        let read_input = ReadInput::new().with_start(
+            ReadStart::new().with_from(ReadFrom::SeqNum(local_state.applied_state.end)),
+        );
         let tailing_reader = futures::StreamExt::flat_map(
-            client
-                .read_session(ReadSessionRequest {
-                    start: ReadStart::SeqNum(local_state.applied_state.end),
-                    limit: ReadLimit::default(),
-                    until: None,
-                    clamp: false,
-                })
-                .await?,
-            |read_output| {
+            stream.read_session(read_input).await?,
+            |read_batch: Result<ReadBatch, S2Error>| {
                 stream! {
-                    let ReadOutput::Batch(batch) = read_output.map_err(KVError::from)? else {
-                        Err(KVError::Weird("received non-batch while tailing"))?
-                    };
+                    let batch = read_batch.map_err(KVError::from)?;
                     for record in batch.records {
                         yield Ok::<SequencedRecord, KVError>(record)
                     }
@@ -260,7 +255,6 @@ impl KVStore {
         )
         .throttle(throttle.throttle_tailing_reader);
 
-        tokio::pin!(append_acknowledgments);
         tokio::pin!(tailing_reader);
 
         loop {
@@ -269,13 +263,16 @@ impl KVStore {
                     trace!(?cmd, "command received");
                     match cmd {
                         OrchestratorCommand::WriteLog { log, response_tx } => {
-                            write_queue.push_back(response_tx);
-                            append_tx.send(AppendInput {
-                                records: AppendRecordBatch::try_from_iter(
-                                    [AppendRecord::new(bytes::Bytes::from(log))?]
-                                ).map_err(|_| KVError::Weird("unable to construct batch"))?,
-                                ..Default::default()
-                            }).map_err(|_| KVError::Weird("s2 append_session rx dropped"))?;
+                            let records = AppendRecordBatch::try_from_iter(
+                                [AppendRecord::new(bytes::Bytes::from(log))?]
+                            ).map_err(|_| KVError::Weird("unable to construct batch"))?;
+                            let input = AppendInput::new(records);
+                            let ticket = append_session.submit(input).await?;
+                            // Wrap ticket with response_tx so we can respond when it completes.
+                            pending_appends.push_back(async move {
+                                let result = ticket.await;
+                                (result, response_tx)
+                            });
                         }
                         OrchestratorCommand::ReadStrongConsistency {
                             key,
@@ -305,10 +302,9 @@ impl KVStore {
                     }
                 }
 
-                Some(ack) = append_acknowledgments.next() => {
+                Some((ack_result, response_tx)) = pending_appends.next() => {
+                    let ack = ack_result?;
                     trace!(?ack);
-                    let ack = ack?;
-                    let response_tx = write_queue.pop_front().expect("queue entry");
                     // Since our `put` and `delete` KV-store actions do not return prior values,
                     // we can acknowledge them as soon as their corresponding log append is ack-ed
                     // by S2, even if they are not yet applied to the local internalized state.
@@ -353,7 +349,7 @@ impl KVStore {
 
     async fn new(
         cancellation_token: CancellationToken,
-        client: StreamClient,
+        stream: S2Stream,
         recover_from: RangeFrom<SequenceNumber>,
         throttle: Throttle,
     ) -> Result<KVStore, KVError> {
@@ -370,7 +366,7 @@ impl KVStore {
             bus_tx,
             _orchestrator_task: tokio::spawn(
                 KVStore::orchestrate(
-                    client.clone(),
+                    stream.clone(),
                     cancellation_token.clone(),
                     local_state,
                     orchestrator_cmd_rx,
@@ -379,7 +375,7 @@ impl KVStore {
                 .inspect_err(|e| error!(?e, "orchestrator task cancelled")),
             ),
             _bus_stand_task: tokio::spawn(
-                KVStore::bus_stand(client, cancellation_token, bus_rx)
+                KVStore::bus_stand(stream, cancellation_token, bus_rx)
                     .inspect_err(|e| error!(?e, "bus stand task cancelled")),
             ),
         })
@@ -598,17 +594,21 @@ async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let stream_client = StreamClient::new(
-        ClientConfig::new(std::env::var("S2_ACCESS_TOKEN")?)
-            .with_endpoints(S2Endpoints::from_env().map_err(|msg| eyre!(msg))?),
-        args.basin.parse::<BasinName>()?,
-        args.stream,
-    );
+    let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?);
+
+    if let Ok(s) = S2Endpoints::from_env() {
+        config = config.with_endpoints(s)
+    };
+
+    let s2 = S2::new(config)?;
+    let stream = s2
+        .basin(args.basin.parse::<BasinName>()?)
+        .stream(args.stream.parse::<StreamName>()?);
     let cancellation_token = CancellationToken::new();
 
     let db = KVStore::new(
         cancellation_token.clone(),
-        stream_client,
+        stream,
         args.recover_from..,
         args.throttle,
     )
