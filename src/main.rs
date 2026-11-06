@@ -12,9 +12,9 @@ use ordered_float::OrderedFloat;
 use s2_sdk::append_session::{AppendSession, AppendSessionConfig};
 use s2_sdk::error::{AppendSessionError, ReadError, ReadSessionError};
 use s2_sdk::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ReadBatch, ReadFrom, ReadInput,
-    ReadSessionConfig, ReadSessionRetryPolicy, ReadStart, S2Config, S2Endpoints, SequencedRecord,
-    StreamName, ValidationError,
+    AppendInput, AppendRecord, AppendRecordBatch, AppendRetryPolicy, BasinName, ReadBatch,
+    ReadFrom, ReadInput, ReadSessionConfig, ReadSessionRetryPolicy, ReadStart, RetryConfig,
+    S2Config, S2Endpoints, SequencedRecord, StreamName, ValidationError,
 };
 use s2_sdk::{S2, S2Stream};
 use serde::{Deserialize, Serialize};
@@ -333,9 +333,9 @@ impl KVStore {
                     // we can acknowledge them as soon as their corresponding log append is ack-ed
                     // by S2, even if they are not yet applied to the local internalized state.
                     //
-                    // A failed append fails only that write (the caller gets a 500; the record may
-                    // or may not have landed). The session is dropped so the next write opens a
-                    // fresh one.
+                    // A failed append fails only that write (the caller gets a 500 and, thanks to
+                    // `AppendRetryPolicy::NoSideEffects`, the record is not in the log). The
+                    // session is dropped so the next write opens a fresh one.
                     let response = match ack_result {
                         Ok(ack) => Ok(..ack.end.seq_num),
                         Err(e) => {
@@ -621,7 +621,11 @@ async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?);
+    // Only retry appends the server provably never saw, so a write that fails with a
+    // 500 is guaranteed not to be in the log (the default `All` could duplicate it).
+    let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?).with_retry(
+        RetryConfig::default().with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
+    );
 
     if let Ok(s) = S2Endpoints::from_env() {
         config = config.with_endpoints(s)

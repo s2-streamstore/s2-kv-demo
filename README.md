@@ -95,7 +95,7 @@ cargo run --release -- \
   "${MY_STREAM}"
 ```
 
-On startup, a node replays the log from the beginning to rebuild its state. If S2 becomes unreachable, the node keeps running: writes and `Strong` reads fail with a `500` once the SDK's retries are exhausted, `Eventual` reads keep working, and the tailing reader reconnects and resumes on its own.
+On startup, a node replays the log from the beginning to rebuild its state. If S2 becomes unreachable, the node keeps running: writes and `Strong` reads fail with a `500` once the SDK's retries are exhausted (a failed write is guaranteed not to be in the log), `Eventual` reads keep working, and the tailing reader reconnects and resumes on its own.
 
 ## Using the store
 
