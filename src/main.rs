@@ -598,8 +598,6 @@ enum ValueResponse {
 #[derive(Clone, Parser, Debug)]
 struct Throttle {
     #[clap(long, default_value = "0ms", value_parser = parse_duration)]
-    throttle_append_acknowledgments: Duration,
-    #[clap(long, default_value = "0ms", value_parser = parse_duration)]
     throttle_tailing_reader: Duration,
 }
 

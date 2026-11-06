@@ -132,9 +132,9 @@ curl -X DELETE -G --data-urlencode \
 
 ### Exploring consistency 
 
-It can be difficult to find instances where eventual consistency reads actually differ from strong reads. For sake of experimentation, nodes can be started with optional delay parameters, which apply a "throttle" to the rate at which log entries are tailed from S2, or the rate at which append acknowledgments are received.
+It can be difficult to find instances where eventual consistency reads actually differ from strong reads. For sake of experimentation, nodes can be started with an optional delay parameter, which applies a "throttle" to the rate at which log entries are tailed from S2.
 
-Try starting a second node, in a new terminal, which sets throttle values.
+Try starting a second node, in a new terminal, which sets a throttle value.
 ```bash
 cargo run --release -- \
   --host "${KV_NODE_2}" \
