@@ -5,7 +5,6 @@ use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use clap::Parser;
-use derivative::Derivative;
 use eyre::eyre;
 use futures::TryFutureExt;
 use humantime::parse_duration;
@@ -164,12 +163,32 @@ impl PendingResponses {
     }
 }
 
-#[derive(Derivative, Debug)]
-#[derivative(Eq, Ord, PartialEq, PartialOrd)]
+/// Ordered (and compared) by `end_seq_num` alone, so `PendingResponses` acts as a
+/// min-heap on the sequence number each response is waiting for.
+#[derive(Debug)]
 struct PendingResponse {
     end_seq_num: Reverse<SequenceNumber>,
-    #[derivative(Ord = "ignore", PartialEq = "ignore", PartialOrd = "ignore")]
     response_context: ResponseContext,
+}
+
+impl PartialEq for PendingResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.end_seq_num == other.end_seq_num
+    }
+}
+
+impl Eq for PendingResponse {}
+
+impl PartialOrd for PendingResponse {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PendingResponse {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.end_seq_num.cmp(&other.end_seq_num)
+    }
 }
 
 impl PendingResponse {
