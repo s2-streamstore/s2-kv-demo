@@ -95,7 +95,9 @@ cargo run --release -- \
   "${MY_STREAM}"
 ```
 
-On startup, a node replays the log from the beginning to rebuild its state. If S2 becomes unreachable, the node keeps running: writes and `Strong` reads fail with a `500` once the SDK's retries are exhausted (a failed write is guaranteed not to be in the log), `Eventual` reads keep working, and the tailing reader reconnects and resumes on its own.
+On startup, a node replays the log from the beginning to rebuild its state.
+
+If S2 becomes unreachable, the node keeps running. `Eventual` reads keep working, and the tailing reader reconnects and resumes on its own. Once the SDK's retries are exhausted, `Strong` reads fail with a `503`, and so do writes that definitely never reached the log (safe to retry). A write that may or may not have reached the log (for example, if the connection dropped after it was sent) fails with a `500` saying its outcome is unknown. Requests S2 would reject, such as a value over the 1 MiB record limit, fail with a `400`.
 
 ## Using the store
 

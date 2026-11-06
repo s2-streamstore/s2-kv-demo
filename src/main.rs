@@ -49,10 +49,70 @@ enum KVError {
     S2Read(#[from] ReadError),
     #[error("s2 read session: {0}")]
     S2ReadSession(#[from] ReadSessionError),
-    #[error("s2 append session: {0}")]
-    S2AppendSession(#[from] AppendSessionError),
-    #[error("{0}")]
-    Weird(&'static str),
+    /// The append definitely did not reach the log; the write can be safely retried.
+    #[error("write not applied (safe to retry): {0}")]
+    WriteNotApplied(AppendSessionError),
+    /// The append may or may not have reached the log (e.g. the connection dropped after
+    /// the request was sent). Retrying could apply the write twice.
+    #[error("write outcome unknown (it may or may not be in the log): {0}")]
+    WriteOutcomeUnknown(AppendSessionError),
+}
+
+impl KVError {
+    /// Classify a failed append by whether S2 could have applied it.
+    fn from_append(e: AppendSessionError) -> Self {
+        if e.has_no_side_effects() {
+            KVError::WriteNotApplied(e)
+        } else {
+            KVError::WriteOutcomeUnknown(e)
+        }
+    }
+
+    fn status_code(&self) -> StatusCode {
+        match self {
+            // Only the request body is validated (e.g. a value over S2's 1 MiB record limit).
+            KVError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            // S2 is unreachable or refused the request, but nothing was changed.
+            KVError::WriteNotApplied(_) | KVError::S2Read(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Holds the current append session, if any, tagged with a generation number.
+///
+/// A dead session fails every append that was in flight on it, and those failures arrive
+/// one at a time. By the time a later one arrives, a newer session may already be serving
+/// writes, so a failure only invalidates the session it came from. (Dropping an
+/// `AppendSession` aborts it, which would fail the newer session's in-flight writes too.)
+struct SessionSlot<T> {
+    session: Option<T>,
+    generation: u64,
+}
+
+impl<T> SessionSlot<T> {
+    fn new() -> Self {
+        Self {
+            session: None,
+            generation: 0,
+        }
+    }
+
+    /// The current session (opening one if needed) and its generation.
+    fn get_or_open(&mut self, open: impl FnOnce() -> T) -> (u64, &mut T) {
+        (self.generation, self.session.get_or_insert_with(open))
+    }
+
+    /// Drop the session if it is still the one from `generation`. Returns whether it was.
+    fn invalidate(&mut self, generation: u64) -> bool {
+        if generation == self.generation && self.session.is_some() {
+            self.session = None;
+            self.generation += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,7 +303,7 @@ impl KVStore {
 
         // Append session, opened on first write and replaced after it fails. The SDK retries
         // transient errors itself, but once its retry budget is exhausted the session is dead.
-        let mut append_session: Option<AppendSession> = None;
+        let mut append_session: SessionSlot<AppendSession> = SessionSlot::new();
         // Track pending append tickets paired with response senders (ordered for FIFO).
         let mut pending_appends: FuturesOrdered<_> = FuturesOrdered::new();
 
@@ -275,26 +335,33 @@ impl KVStore {
                     trace!(?cmd, "command received");
                     match cmd {
                         OrchestratorCommand::WriteLog { log, response_tx } => {
-                            let records = AppendRecordBatch::try_from_iter(
-                                [AppendRecord::new(bytes::Bytes::from(log))?]
-                            ).map_err(|_| KVError::Weird("unable to construct batch"))?;
-                            let input = AppendInput::new(records);
-                            let submitted = append_session
-                                .get_or_insert_with(|| stream.append_session(AppendSessionConfig::default()))
-                                .submit(input)
-                                .await;
-                            match submitted {
+                            // An invalid record (e.g. a value over S2's size limit) fails only
+                            // this write, rather than taking down the node.
+                            let input = match AppendRecord::new(bytes::Bytes::from(log))
+                                .and_then(|record| AppendRecordBatch::try_from_iter([record]))
+                            {
+                                Ok(records) => AppendInput::new(records),
+                                Err(e) => {
+                                    _ = response_tx
+                                        .send(Err(e.into()))
+                                        .inspect_err(|_| debug!("write ack rx dropped"));
+                                    continue;
+                                }
+                            };
+                            let (generation, session) = append_session
+                                .get_or_open(|| stream.append_session(AppendSessionConfig::default()));
+                            match session.submit(input).await {
                                 Ok(ticket) => {
                                     // Wrap ticket with response_tx so we can respond when it completes.
                                     pending_appends.push_back(async move {
                                         let result = ticket.await;
-                                        (result, response_tx)
+                                        (result, generation, response_tx)
                                     });
                                 }
                                 Err(e) => {
-                                    append_session = None;
+                                    append_session.invalidate(generation);
                                     _ = response_tx
-                                        .send(Err(e.into()))
+                                        .send(Err(KVError::from_append(e)))
                                         .inspect_err(|_| debug!("write ack rx dropped"));
                                 }
                             }
@@ -327,20 +394,22 @@ impl KVStore {
                     }
                 }
 
-                Some((ack_result, response_tx)) = pending_appends.next() => {
+                Some((ack_result, generation, response_tx)) = pending_appends.next() => {
                     trace!(?ack_result);
                     // Since our `put` and `delete` KV-store actions do not return prior values,
                     // we can acknowledge them as soon as their corresponding log append is ack-ed
                     // by S2, even if they are not yet applied to the local internalized state.
                     //
-                    // A failed append fails only that write (the caller gets a 500 and, thanks to
-                    // `AppendRetryPolicy::NoSideEffects`, the record is not in the log). The
-                    // session is dropped so the next write opens a fresh one.
+                    // A failed append fails only that write, and the caller is told whether it
+                    // definitely did not reach the log or might have. The session it came from is
+                    // dropped (if it is still current) so the next write opens a fresh one.
                     let response = match ack_result {
                         Ok(ack) => Ok(..ack.end.seq_num),
                         Err(e) => {
-                            append_session = None;
-                            Err(e.into())
+                            if !append_session.invalidate(generation) {
+                                debug!(generation, "failure from an already-replaced append session");
+                            }
+                            Err(KVError::from_append(e))
                         }
                     };
                     _ = response_tx
@@ -517,10 +586,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
                 StatusCode::NOT_FOUND,
                 Json(ValueResponse::Missing(applied_state)),
             ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ValueResponse::Error(e.to_string())),
-            ),
+            Err(e) => (e.status_code(), Json(ValueResponse::Error(e.to_string()))),
         }
     }
 
@@ -531,7 +597,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
         match db_container.put(put.key, put.value).await {
             Ok(applied_state) => (StatusCode::OK, Json(SequenceResponse::Ok(applied_state))),
             Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(SequenceResponse::Error(e.to_string())),
             ),
         }
@@ -544,7 +610,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
         match db_container.delete(key.key).await {
             Ok(applied_state) => (StatusCode::OK, Json(SequenceResponse::Ok(applied_state))),
             Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(SequenceResponse::Error(e.to_string())),
             ),
         }
@@ -621,8 +687,9 @@ async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    // Only retry appends the server provably never saw, so a write that fails with a
-    // 500 is guaranteed not to be in the log (the default `All` could duplicate it).
+    // Only retry appends the server provably never saw, so the SDK never duplicates a
+    // write (the default `All` could). A write can still fail with an unknown outcome,
+    // e.g. if the connection drops after it was sent; see `KVError::from_append`.
     let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?).with_retry(
         RetryConfig::default().with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
     );
@@ -651,7 +718,57 @@ async fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use crate::{PendingResponse, PendingResponses, ResponseContext};
+    use crate::{KVError, PendingResponse, PendingResponses, ResponseContext, SessionSlot};
+    use axum::http::StatusCode;
+    use s2_sdk::error::AppendSessionError;
+    use s2_sdk::types::AppendRecord;
+
+    #[test]
+    fn test_session_slot_ignores_stale_failures() {
+        let mut slot = SessionSlot::new();
+
+        // First session fails with two appends in flight on it.
+        let (gen_a, _) = slot.get_or_open(|| "a");
+        assert!(slot.invalidate(gen_a));
+
+        // A new write opens a fresh session before the second failure arrives.
+        let (gen_b, session) = slot.get_or_open(|| "b");
+        assert_ne!(gen_a, gen_b);
+        assert_eq!(*session, "b");
+
+        // The late failure from the old session must not drop the new one.
+        assert!(!slot.invalidate(gen_a));
+        assert_eq!(*slot.get_or_open(|| "c").1, "b");
+
+        // A failure from the current session does.
+        assert!(slot.invalidate(gen_b));
+        assert_eq!(*slot.get_or_open(|| "c").1, "c");
+    }
+
+    #[test]
+    fn test_append_error_classification() {
+        // Never sent, so definitely not in the log.
+        let not_applied = KVError::from_append(AppendSessionError::SessionClosed);
+        assert!(matches!(not_applied, KVError::WriteNotApplied(_)));
+        assert_eq!(not_applied.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Sent but never acknowledged, so it may be in the log.
+        for e in [
+            AppendSessionError::AckTimeout,
+            AppendSessionError::ServerDisconnected,
+            AppendSessionError::SessionDropped,
+        ] {
+            let unknown = KVError::from_append(e);
+            assert!(matches!(unknown, KVError::WriteOutcomeUnknown(_)));
+            assert_eq!(unknown.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn test_oversized_record_is_a_bad_request() {
+        let err = AppendRecord::new(vec![b'x'; 2 * 1024 * 1024]).expect_err("over 1 MiB limit");
+        assert_eq!(KVError::from(err).status_code(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_pending_responses() {
