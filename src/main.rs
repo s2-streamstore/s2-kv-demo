@@ -460,9 +460,10 @@ impl KVStore {
 
     /// Put a new key/value to the store.
     ///
-    /// This will wait until the associated write is made durable on the log, and until
-    /// the log has been applied to the materialized state on this node, before returning
-    /// an `Ok` response.
+    /// Returns `Ok` once the associated write is durable on the log (i.e. S2 has
+    /// acknowledged the append). It does not wait for the write to be applied to this
+    /// node's materialized state, so an immediate `Eventual` read may not reflect it;
+    /// a `Strong` read will.
     async fn put(&self, key: String, value: Value) -> Result<RangeTo<SequenceNumber>, KVError> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -480,9 +481,10 @@ impl KVStore {
 
     /// Delete a key and its value from the store.
     ///
-    /// This will wait until the associated write is made durable on the log, and until
-    /// the log has been applied to the materialized state on this node, before returning
-    /// an `Ok` response.
+    /// Returns `Ok` once the associated write is durable on the log (i.e. S2 has
+    /// acknowledged the append). It does not wait for the write to be applied to this
+    /// node's materialized state, so an immediate `Eventual` read may not reflect it;
+    /// a `Strong` read will.
     async fn delete(&self, key: String) -> Result<RangeTo<SequenceNumber>, KVError> {
         let (response_tx, response_rx) = oneshot::channel();
 
