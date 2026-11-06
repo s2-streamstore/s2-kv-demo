@@ -11,9 +11,11 @@ use futures::TryFutureExt;
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
 use s2_sdk::append_session::AppendSessionConfig;
+use s2_sdk::error::{AppendSessionError, ReadError, ReadSessionError};
 use s2_sdk::types::{
     AppendInput, AppendRecord, AppendRecordBatch, BasinName, ReadBatch, ReadFrom, ReadInput,
-    ReadStart, S2Config, S2Endpoints, S2Error, SequencedRecord, StreamName, ValidationError,
+    ReadSessionConfig, ReadStart, S2Config, S2Endpoints, SequencedRecord, StreamName,
+    ValidationError,
 };
 use s2_sdk::{S2, S2Stream};
 use serde::{Deserialize, Serialize};
@@ -47,8 +49,12 @@ enum KVError {
     OrchestratorTaskFailure,
     #[error("validation: {0}")]
     ValidationError(#[from] ValidationError),
-    #[error("s2: {0}")]
-    S2Error(#[from] S2Error),
+    #[error("s2 read: {0}")]
+    S2Read(#[from] ReadError),
+    #[error("s2 read session: {0}")]
+    S2ReadSession(#[from] ReadSessionError),
+    #[error("s2 append session: {0}")]
+    S2AppendSession(#[from] AppendSessionError),
     #[error("{0}")]
     Weird(&'static str),
 }
@@ -243,8 +249,10 @@ impl KVStore {
             ReadStart::new().with_from(ReadFrom::SeqNum(local_state.applied_state.end)),
         );
         let tailing_reader = futures::StreamExt::flat_map(
-            stream.read_session(read_input).await?,
-            |read_batch: Result<ReadBatch, S2Error>| {
+            stream
+                .read_session(read_input, ReadSessionConfig::default())
+                .await?,
+            |read_batch: Result<ReadBatch, ReadSessionError>| {
                 stream! {
                     let batch = read_batch.map_err(KVError::from)?;
                     for record in batch.records {
