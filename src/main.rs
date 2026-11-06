@@ -529,7 +529,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
 
     Router::new()
         .route(
-            "/api/:consistency",
+            "/api/{consistency}",
             get({
                 let db = db_container.clone();
                 move |path, key| async move { get_value(path, key, db).await }

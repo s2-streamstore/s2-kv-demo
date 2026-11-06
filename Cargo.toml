@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-stream = "0.3.6"
-axum = "0.7.9"
+axum = "0.8"
 bytes = "1.9.0"
 clap = { version = "4.5.23", features = ["derive"] }
 derivative = "2.2.0"
