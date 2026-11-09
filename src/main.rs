@@ -9,23 +9,22 @@ use eyre::eyre;
 use futures::TryFutureExt;
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
-use s2_sdk::append_session::AppendSessionConfig;
+use s2_sdk::append_session::{AppendSession, AppendSessionConfig};
 use s2_sdk::error::{AppendSessionError, ReadError, ReadSessionError};
 use s2_sdk::types::{
-    AppendInput, AppendRecord, AppendRecordBatch, BasinName, ReadBatch, ReadFrom, ReadInput,
-    ReadSessionConfig, ReadStart, S2Config, S2Endpoints, SequencedRecord, StreamName,
-    ValidationError,
+    AppendInput, AppendRecord, AppendRecordBatch, AppendRetryPolicy, BasinName, ReadBatch,
+    ReadFrom, ReadInput, ReadSessionConfig, ReadSessionRetryPolicy, ReadStart, RetryConfig,
+    S2Config, S2Endpoints, SequencedRecord, StreamName, ValidationError,
 };
 use s2_sdk::{S2, S2Stream};
 use serde::{Deserialize, Serialize};
 use std::cmp::PartialEq;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::ops::{RangeFrom, RangeTo};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::ops::RangeTo;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, sleep_until};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
@@ -35,8 +34,6 @@ type SequenceNumber = u64;
 type SequencedValue = (RangeTo<SequenceNumber>, Option<Value>);
 type WriteSender = oneshot::Sender<Result<RangeTo<SequenceNumber>, KVError>>;
 type ReadSender = oneshot::Sender<Result<SequencedValue, KVError>>;
-
-const BUS_RIDER_MAX_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 enum KVError {
@@ -52,10 +49,70 @@ enum KVError {
     S2Read(#[from] ReadError),
     #[error("s2 read session: {0}")]
     S2ReadSession(#[from] ReadSessionError),
-    #[error("s2 append session: {0}")]
-    S2AppendSession(#[from] AppendSessionError),
-    #[error("{0}")]
-    Weird(&'static str),
+    /// The append definitely did not reach the log; the write can be safely retried.
+    #[error("write not applied (safe to retry): {0}")]
+    WriteNotApplied(AppendSessionError),
+    /// The append may or may not have reached the log (e.g. the connection dropped after
+    /// the request was sent). Retrying could apply the write twice.
+    #[error("write outcome unknown (it may or may not be in the log): {0}")]
+    WriteOutcomeUnknown(AppendSessionError),
+}
+
+impl KVError {
+    /// Classify a failed append by whether S2 could have applied it.
+    fn from_append(e: AppendSessionError) -> Self {
+        if e.has_no_side_effects() {
+            KVError::WriteNotApplied(e)
+        } else {
+            KVError::WriteOutcomeUnknown(e)
+        }
+    }
+
+    fn status_code(&self) -> StatusCode {
+        match self {
+            // Only the request body is validated (e.g. a value over S2's 1 MiB record limit).
+            KVError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            // S2 is unreachable or refused the request, but nothing was changed.
+            KVError::WriteNotApplied(_) | KVError::S2Read(_) => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Holds the current append session, if any, tagged with a generation number.
+///
+/// A dead session fails every append that was in flight on it, and those failures arrive
+/// one at a time. By the time a later one arrives, a newer session may already be serving
+/// writes, so a failure only invalidates the session it came from. (Dropping an
+/// `AppendSession` aborts it, which would fail the newer session's in-flight writes too.)
+struct SessionSlot<T> {
+    session: Option<T>,
+    generation: u64,
+}
+
+impl<T> SessionSlot<T> {
+    fn new() -> Self {
+        Self {
+            session: None,
+            generation: 0,
+        }
+    }
+
+    /// The current session (opening one if needed) and its generation.
+    fn get_or_open(&mut self, open: impl FnOnce() -> T) -> (u64, &mut T) {
+        (self.generation, self.session.get_or_insert_with(open))
+    }
+
+    /// Drop the session if it is still the one from `generation`. Returns whether it was.
+    fn invalidate(&mut self, generation: u64) -> bool {
+        if generation == self.generation && self.session.is_some() {
+            self.session = None;
+            self.generation += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +159,6 @@ impl From<LogEntry> for Bytes {
 }
 
 struct BusRider {
-    max_wait: Duration,
     response_tx: oneshot::Sender<Result<RangeTo<SequenceNumber>, KVError>>,
 }
 
@@ -210,34 +266,21 @@ impl KVStore {
     ) -> Result<(), KVError> {
         let _guard = cancellation_token.drop_guard();
 
-        let sometime_later = Duration::from_secs(3600 * 24);
-        let mut next_departure = Instant::now() + sometime_later;
-        let mut queue = VecDeque::new();
-
-        loop {
-            tokio::select! {
-                Some(BusRider { max_wait, response_tx }) = inbox.recv() => {
-                    trace!("new bus rider");
-                    let desired_departure = Instant::now() + max_wait;
-                    if desired_departure < next_departure {
-                        next_departure = desired_departure;
-                    }
-                    queue.push_back(response_tx);
-                },
-                _ = sleep_until(next_departure), if !queue.is_empty() => {
-                    trace!(num_passengers=queue.len(), "next departure is leaving!");
-                    let tail = stream.check_tail().await?;
-                    trace!(?tail);
-                    for rider in queue.drain(..) {
-                        _ = rider
-                            .send(Ok(..tail.seq_num))
-                            .inspect_err(|_| debug!("SC caller disconnected before check_tail returned"));
-                    }
-                    next_departure = Instant::now() + sometime_later;
-                }
-                else => {
-                    break;
-                }
+        // A bus leaves as soon as there is a rider and no bus is already out. Riders who
+        // show up while a `check_tail` is in flight board the next one, so under load
+        // each round trip serves everyone who arrived during the previous one.
+        while let Some(BusRider { response_tx }) = inbox.recv().await {
+            let mut riders = vec![response_tx];
+            while let Ok(BusRider { response_tx }) = inbox.try_recv() {
+                riders.push(response_tx);
+            }
+            trace!(num_passengers = riders.len(), "next departure is leaving!");
+            let tail = stream.check_tail().await.map(|tail| ..tail.seq_num);
+            trace!(?tail);
+            for rider in riders {
+                _ = rider
+                    .send(tail.clone().map_err(KVError::from))
+                    .inspect_err(|_| debug!("SC caller disconnected before check_tail returned"));
             }
         }
 
@@ -258,19 +301,21 @@ impl KVStore {
         // Blocked responses for internal callers.
         let mut pending_responses = PendingResponses::default();
 
-        // Start an append session.
-        let append_session = stream.append_session(AppendSessionConfig::default());
+        // Append session, opened on first write and replaced after it fails. The SDK retries
+        // transient errors itself, but once its retry budget is exhausted the session is dead.
+        let mut append_session: SessionSlot<AppendSession> = SessionSlot::new();
         // Track pending append tickets paired with response senders (ordered for FIFO).
         let mut pending_appends: FuturesOrdered<_> = FuturesOrdered::new();
 
-        // Start a tailing read session.
+        // Start a tailing read session. It reconnects and resumes on its own for as long as
+        // S2 is unreachable; only non-retryable errors end it (and with it, the node).
         let read_input = ReadInput::new().with_start(
             ReadStart::new().with_from(ReadFrom::SeqNum(local_state.applied_state.end)),
         );
+        let read_config =
+            ReadSessionConfig::new().with_retry_policy(ReadSessionRetryPolicy::Indefinite);
         let tailing_reader = futures::StreamExt::flat_map(
-            stream
-                .read_session(read_input, ReadSessionConfig::default())
-                .await?,
+            stream.read_session(read_input, read_config).await?,
             |read_batch: Result<ReadBatch, ReadSessionError>| {
                 stream! {
                     let batch = read_batch.map_err(KVError::from)?;
@@ -290,16 +335,36 @@ impl KVStore {
                     trace!(?cmd, "command received");
                     match cmd {
                         OrchestratorCommand::WriteLog { log, response_tx } => {
-                            let records = AppendRecordBatch::try_from_iter(
-                                [AppendRecord::new(bytes::Bytes::from(log))?]
-                            ).map_err(|_| KVError::Weird("unable to construct batch"))?;
-                            let input = AppendInput::new(records);
-                            let ticket = append_session.submit(input).await?;
-                            // Wrap ticket with response_tx so we can respond when it completes.
-                            pending_appends.push_back(async move {
-                                let result = ticket.await;
-                                (result, response_tx)
-                            });
+                            // An invalid record (e.g. a value over S2's size limit) fails only
+                            // this write, rather than taking down the node.
+                            let input = match AppendRecord::new(bytes::Bytes::from(log))
+                                .and_then(|record| AppendRecordBatch::try_from_iter([record]))
+                            {
+                                Ok(records) => AppendInput::new(records),
+                                Err(e) => {
+                                    _ = response_tx
+                                        .send(Err(e.into()))
+                                        .inspect_err(|_| debug!("write ack rx dropped"));
+                                    continue;
+                                }
+                            };
+                            let (generation, session) = append_session
+                                .get_or_open(|| stream.append_session(AppendSessionConfig::default()));
+                            match session.submit(input).await {
+                                Ok(ticket) => {
+                                    // Wrap ticket with response_tx so we can respond when it completes.
+                                    pending_appends.push_back(async move {
+                                        let result = ticket.await;
+                                        (result, generation, response_tx)
+                                    });
+                                }
+                                Err(e) => {
+                                    append_session.invalidate(generation);
+                                    _ = response_tx
+                                        .send(Err(KVError::from_append(e)))
+                                        .inspect_err(|_| debug!("write ack rx dropped"));
+                                }
+                            }
                         }
                         OrchestratorCommand::ReadStrongConsistency {
                             key,
@@ -329,14 +394,26 @@ impl KVStore {
                     }
                 }
 
-                Some((ack_result, response_tx)) = pending_appends.next() => {
-                    let ack = ack_result?;
-                    trace!(?ack);
+                Some((ack_result, generation, response_tx)) = pending_appends.next() => {
+                    trace!(?ack_result);
                     // Since our `put` and `delete` KV-store actions do not return prior values,
                     // we can acknowledge them as soon as their corresponding log append is ack-ed
                     // by S2, even if they are not yet applied to the local internalized state.
+                    //
+                    // A failed append fails only that write, and the caller is told whether it
+                    // definitely did not reach the log or might have. The session it came from is
+                    // dropped (if it is still current) so the next write opens a fresh one.
+                    let response = match ack_result {
+                        Ok(ack) => Ok(..ack.end.seq_num),
+                        Err(e) => {
+                            if !append_session.invalidate(generation) {
+                                debug!(generation, "failure from an already-replaced append session");
+                            }
+                            Err(KVError::from_append(e))
+                        }
+                    };
                     _ = response_tx
-                        .send(Ok(..ack.end.seq_num))
+                        .send(response)
                         .inspect_err(|_| debug!("write ack rx dropped"));
                 }
 
@@ -377,14 +454,13 @@ impl KVStore {
     async fn new(
         cancellation_token: CancellationToken,
         stream: S2Stream,
-        recover_from: RangeFrom<SequenceNumber>,
         throttle: Throttle,
     ) -> Result<KVStore, KVError> {
         let (orchestrator_cmd_tx, orchestrator_cmd_rx) = mpsc::unbounded_channel();
         let (bus_tx, bus_rx) = mpsc::unbounded_channel();
 
         let local_state = LocalState {
-            applied_state: ..recover_from.start,
+            applied_state: ..0,
             storage: Default::default(),
         };
 
@@ -410,19 +486,14 @@ impl KVStore {
 
     /// Get the current stream's tail.
     ///
-    /// Wait up to `max_wait` before the actual `check_tail` invocation occurs, allowing
-    /// other callers to also be served by the same underlying S2 tail op.
-    async fn bus_stand_check_tail(
-        &self,
-        max_wait: Duration,
-    ) -> Result<RangeTo<SequenceNumber>, KVError> {
+    /// Callers that arrive while a `check_tail` is already in flight are served by the
+    /// next one, so concurrent strong reads share S2 tail ops instead of each issuing
+    /// their own.
+    async fn bus_stand_check_tail(&self) -> Result<RangeTo<SequenceNumber>, KVError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.bus_tx
-            .send(BusRider {
-                max_wait,
-                response_tx,
-            })
+            .send(BusRider { response_tx })
             .map_err(|_| KVError::BusStandTaskFailure)?;
 
         response_rx
@@ -444,7 +515,7 @@ impl KVStore {
             }
             ReadConsistency::Strong => OrchestratorCommand::ReadStrongConsistency {
                 key,
-                reflect_applied_state: self.bus_stand_check_tail(BUS_RIDER_MAX_WAIT).await?,
+                reflect_applied_state: self.bus_stand_check_tail().await?,
                 response_tx,
             },
         };
@@ -515,10 +586,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
                 StatusCode::NOT_FOUND,
                 Json(ValueResponse::Missing(applied_state)),
             ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ValueResponse::Error(e.to_string())),
-            ),
+            Err(e) => (e.status_code(), Json(ValueResponse::Error(e.to_string()))),
         }
     }
 
@@ -529,7 +597,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
         match db_container.put(put.key, put.value).await {
             Ok(applied_state) => (StatusCode::OK, Json(SequenceResponse::Ok(applied_state))),
             Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(SequenceResponse::Error(e.to_string())),
             ),
         }
@@ -542,7 +610,7 @@ fn router(db_container: Arc<KVStore>) -> Router<()> {
         match db_container.delete(key.key).await {
             Ok(applied_state) => (StatusCode::OK, Json(SequenceResponse::Ok(applied_state))),
             Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(SequenceResponse::Error(e.to_string())),
             ),
         }
@@ -610,8 +678,6 @@ struct Args {
     stream: String,
     #[arg(long)]
     host: String,
-    #[arg(long, default_value_t = 0)]
-    recover_from: SequenceNumber,
     #[clap(flatten)]
     throttle: Throttle,
 }
@@ -621,7 +687,12 @@ async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?);
+    // Only retry appends the server provably never saw, so the SDK never duplicates a
+    // write (the default `All` could). A write can still fail with an unknown outcome,
+    // e.g. if the connection drops after it was sent; see `KVError::from_append`.
+    let mut config = S2Config::new(std::env::var("S2_ACCESS_TOKEN")?).with_retry(
+        RetryConfig::default().with_append_retry_policy(AppendRetryPolicy::NoSideEffects),
+    );
 
     if let Ok(s) = S2Endpoints::from_env() {
         config = config.with_endpoints(s)
@@ -633,13 +704,7 @@ async fn main() -> eyre::Result<()> {
         .stream(args.stream.parse::<StreamName>()?);
     let cancellation_token = CancellationToken::new();
 
-    let db = KVStore::new(
-        cancellation_token.clone(),
-        stream,
-        args.recover_from..,
-        args.throttle,
-    )
-    .await?;
+    let db = KVStore::new(cancellation_token.clone(), stream, args.throttle).await?;
 
     tokio::select! {
        _ = axum::serve(tokio::net::TcpListener::bind(args.host).await?, router(Arc::new(db))) => {
@@ -653,7 +718,57 @@ async fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use crate::{PendingResponse, PendingResponses, ResponseContext};
+    use crate::{KVError, PendingResponse, PendingResponses, ResponseContext, SessionSlot};
+    use axum::http::StatusCode;
+    use s2_sdk::error::AppendSessionError;
+    use s2_sdk::types::AppendRecord;
+
+    #[test]
+    fn test_session_slot_ignores_stale_failures() {
+        let mut slot = SessionSlot::new();
+
+        // First session fails with two appends in flight on it.
+        let (gen_a, _) = slot.get_or_open(|| "a");
+        assert!(slot.invalidate(gen_a));
+
+        // A new write opens a fresh session before the second failure arrives.
+        let (gen_b, session) = slot.get_or_open(|| "b");
+        assert_ne!(gen_a, gen_b);
+        assert_eq!(*session, "b");
+
+        // The late failure from the old session must not drop the new one.
+        assert!(!slot.invalidate(gen_a));
+        assert_eq!(*slot.get_or_open(|| "c").1, "b");
+
+        // A failure from the current session does.
+        assert!(slot.invalidate(gen_b));
+        assert_eq!(*slot.get_or_open(|| "c").1, "c");
+    }
+
+    #[test]
+    fn test_append_error_classification() {
+        // Never sent, so definitely not in the log.
+        let not_applied = KVError::from_append(AppendSessionError::SessionClosed);
+        assert!(matches!(not_applied, KVError::WriteNotApplied(_)));
+        assert_eq!(not_applied.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Sent but never acknowledged, so it may be in the log.
+        for e in [
+            AppendSessionError::AckTimeout,
+            AppendSessionError::ServerDisconnected,
+            AppendSessionError::SessionDropped,
+        ] {
+            let unknown = KVError::from_append(e);
+            assert!(matches!(unknown, KVError::WriteOutcomeUnknown(_)));
+            assert_eq!(unknown.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[test]
+    fn test_oversized_record_is_a_bad_request() {
+        let err = AppendRecord::new(vec![b'x'; 2 * 1024 * 1024]).expect_err("over 1 MiB limit");
+        assert_eq!(KVError::from(err).status_code(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn test_pending_responses() {

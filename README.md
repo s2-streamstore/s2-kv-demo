@@ -95,7 +95,9 @@ cargo run --release -- \
   "${MY_STREAM}"
 ```
 
-On startup, a node replays the log from the beginning to rebuild its state. Pass `--recover-from <seq_num>` to start from a later point instead.
+On startup, a node replays the log from the beginning to rebuild its state.
+
+If S2 becomes unreachable, the node keeps running. `Eventual` reads keep working, and the tailing reader reconnects and resumes on its own. Once the SDK's retries are exhausted, `Strong` reads fail with a `503`, and so do writes that definitely never reached the log (safe to retry). A write that may or may not have reached the log (for example, if the connection dropped after it was sent) fails with a `500` saying its outcome is unknown. Requests S2 would reject, such as a value over the 1 MiB record limit, fail with a `400`.
 
 ## Using the store
 
@@ -152,7 +154,7 @@ Reads require a read consistency to be specified in the URL: either `/api/Strong
 
 Eventually consistent reads will return a value immediately from the current materialized state.
 
-Strongly consistent reads will perform a `check_tail` operation to find the current tail of the log, and wait to verify that the materialized state has caught up to that value. Strong reads that arrive close together share a single `check_tail` call (the "bus stand" optimization described in [this paper](https://maheshba.bitbucket.io/papers/osr2024.pdf)).
+Strongly consistent reads will perform a `check_tail` operation to find the current tail of the log, and wait to verify that the materialized state has caught up to that value. A strong read issues `check_tail` immediately unless one is already in flight, in which case it waits for the next one along with everyone else who arrived in the meantime (the "bus stand" optimization described in [this paper](https://maheshba.bitbucket.io/papers/osr2024.pdf)). So an idle node's strong reads cost one `check_tail` round trip, and a busy node's strong reads share them.
 
 ```bash
 # SC read
